@@ -1,23 +1,47 @@
-# OS-generated files
-.DS_Store
-Thumbs.db
+# ── Rust ─────────────────────────────────────────────────────────────────────
+/src-tauri/target/
+**/*.rs.bk
+*.pdb
 
-# Editor/IDE files
-.vscode/
+# ── Node ─────────────────────────────────────────────────────────────────────
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# ── Tauri generated ──────────────────────────────────────────────────────────
+/src-tauri/gen/
+/src-tauri/WixTools/
+
+# ── Editors ──────────────────────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
 .idea/
 *.swp
 *.swo
+*~
 
-# Environment and logs
-.env
-.env.*
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Logs & debug ─────────────────────────────────────────────────────────────
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 *.log
 
-# Dependency directories
-node_modules/
-
-# Build output
-dist/
-build/
-out/
-
+# ── Local data / secrets ─────────────────────────────────────────────────────
+# Never commit databases, keys, or transferred files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.pem
+*.key
+.env
+.env.*
+!.env.example
