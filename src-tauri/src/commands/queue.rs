@@ -28,10 +28,9 @@ pub async fn queue_file(
         }
     }
 
-    // Hash the file
-    let file_bytes = std::fs::read(&path)
-        .map_err(|e| format!("Cannot read file: {}", e))?;
-    let sha256 = crate::services::security::SecurityModule::hash_file(&file_bytes);
+    // Hash the file (streaming to avoid loading whole file in memory)
+    let sha256 = crate::services::security::SecurityModule::hash_file_path(&path)
+        .map_err(|e| format!("Cannot hash file: {}", e))?;
 
     let file_name = path.file_name()
         .unwrap_or_default()

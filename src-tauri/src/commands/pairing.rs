@@ -90,11 +90,15 @@ pub async fn pair_with_device(
     state: State<'_, AppState>,
     peer_host: String,
     peer_port: u16,
+    expected_peer_device_id: String,
     pin: String,
 ) -> Result<serde_json::Value, String> {
     let pin = pin.replace(' ', "");
     if pin.len() != 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
         return Err("Enter a valid 6-digit code".to_string());
+    }
+    if expected_peer_device_id.trim().is_empty() {
+        return Err("Missing target device identity".to_string());
     }
 
     // Gather our own identity to send to Device A
@@ -109,16 +113,33 @@ pub async fn pair_with_device(
             .map_err(|e| format!("No device identity: {}", e))?
     };
 
+    let my_cert_fingerprint: String = {
+        let db = state.db.lock().await;
+        db.conn()
+            .query_row(
+                "SELECT value FROM storage_config WHERE key = 'local_cert_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default()
+    };
+
+    if my_cert_fingerprint.is_empty() {
+        return Err("Secure channel is not ready yet. Please try again.".to_string());
+    }
+
     let request = PairMessage::PairRequest {
         device_id: my_id.clone(),
         name: my_name,
         device_type: my_type,
         public_key: STANDARD.encode(&my_pubkey),
+        cert_fingerprint: my_cert_fingerprint,
         pin: pin.clone(),
     };
 
     // Connect over QUIC and exchange identities
-    let response = crate::services::transfer::send_pair_request(&peer_host, peer_port, request)
+    let (response, observed_cert_fp) =
+        crate::services::transfer::send_pair_request(&peer_host, peer_port, request)
         .await
         .map_err(|e| format!("Could not reach the other device: {}", e))?;
 
@@ -128,9 +149,17 @@ pub async fn pair_with_device(
             name,
             device_type,
             public_key,
+            cert_fingerprint,
             group_id,
             verification_emojis,
         } => {
+            if device_id != expected_peer_device_id {
+                return Err("Device identity mismatch. Pairing was blocked.".to_string());
+            }
+            if !cert_fingerprint.is_empty() && cert_fingerprint != observed_cert_fp {
+                return Err("Certificate mismatch detected. Pairing was blocked.".to_string());
+            }
+
             // Derive the same group key from the PIN
             let group_key = SecurityModule::derive_group_key_from_pairing_code(&pin)
                 .map_err(|e| format!("Key derivation failed: {}", e))?;
@@ -153,9 +182,17 @@ pub async fn pair_with_device(
                     "INSERT OR REPLACE INTO paired_devices
                      (device_id, name, type, public_key, group_id, last_seen_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-                    rusqlite::params![device_id, name, device_type, peer_pubkey_bytes, group_id],
+                    rusqlite::params![&device_id, &name, &device_type, peer_pubkey_bytes, &group_id],
                 )
                 .map_err(|e| format!("Failed to store peer: {}", e))?;
+
+            let key = format!("peer_cert_fp:{}", device_id);
+            db.conn()
+                .execute(
+                    "INSERT OR REPLACE INTO storage_config (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![key, observed_cert_fp],
+                )
+                .map_err(|e| format!("Failed to store peer certificate fingerprint: {}", e))?;
 
             log::info!("Paired with {} ({}) — emojis: {}", name, device_id, verification_emojis);
 

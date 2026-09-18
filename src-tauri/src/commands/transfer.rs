@@ -9,21 +9,46 @@ pub async fn send_files(
     file_paths: Vec<String>,
     target_device_id: String,
 ) -> Result<Vec<String>, String> {
-    // Validate target device is paired
-    let db = state.db.lock().await;
-    let device_exists: bool = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM paired_devices WHERE device_id = ?1",
-            [&target_device_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
+    // Validate target device is paired and load group key
+    let (group_key, peer_cert_fingerprint, sender_device_id): (Vec<u8>, String, String) = {
+        let db = state.db.lock().await;
+        let key = db
+            .conn()
+            .query_row(
+                "SELECT tg.group_key_encrypted
+                 FROM trust_group tg
+                 INNER JOIN paired_devices pd ON pd.group_id = tg.group_id
+                 WHERE pd.device_id = ?1",
+                [&target_device_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Target device is not paired or has no group key".to_string())?;
 
-    if !device_exists {
-        return Err("Target device is not paired".to_string());
+        let cert_key = format!("peer_cert_fp:{}", target_device_id);
+        let cert_fp = db
+            .conn()
+            .query_row(
+                "SELECT value FROM storage_config WHERE key = ?1",
+                [cert_key],
+                |row| row.get(0),
+            )
+            .map_err(|_| "No pinned certificate for this device. Re-pair it to continue.".to_string())?;
+        let sender_id = db
+            .conn()
+            .query_row(
+                "SELECT id FROM device_self LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "No local device identity found".to_string())?;
+        (key, cert_fp, sender_id)
+    };
+
+    let peer = {
+        let discovery = state.discovery.lock().await;
+        discovery.find_peer(&target_device_id)
     }
-    drop(db);
+    .ok_or_else(|| "Target device is offline or not discoverable".to_string())?;
 
     // Check storage for each file
     let storage = state.storage.lock().await;
@@ -44,21 +69,16 @@ pub async fn send_files(
     let mut transfer_ids = Vec::new();
 
     for path in &file_paths {
-        // TODO: Look up peer's host/port from discovery service
-        let peer_host = "0.0.0.0"; // placeholder
-        let peer_port = 9876; // placeholder
-        let group_key = vec![0u8; 32]; // placeholder
-
         let result = {
             let mut engine = state.transfer.lock().await;
             engine
                 .send_file(
                     std::path::PathBuf::from(path),
-                    peer_host,
-                    peer_port,
+                    &peer.host,
+                    peer.port,
                     &group_key,
-                    None,          // peer_cert: None in dev (uses insecure verifier)
-                    &target_device_id,
+                    Some(&peer_cert_fingerprint),
+                    &sender_device_id,
                 )
                 .await
         };
@@ -116,21 +136,9 @@ pub async fn get_transfers(
 ) -> Result<Vec<Transfer>, String> {
     let db = state.db.lock().await;
 
-    let query = match &status_filter {
-        Some(status) => format!(
-            "SELECT transfer_id, direction, peer_device_id, file_name, file_size, mime_type, sha256, status, chunks_total, chunks_completed, started_at, completed_at, error_message FROM transfers WHERE status = '{}' ORDER BY started_at DESC",
-            status
-        ),
-        None => "SELECT transfer_id, direction, peer_device_id, file_name, file_size, mime_type, sha256, status, chunks_total, chunks_completed, started_at, completed_at, error_message FROM transfers ORDER BY started_at DESC".to_string(),
-    };
+    let base_select = "SELECT transfer_id, direction, peer_device_id, file_name, file_size, mime_type, sha256, status, chunks_total, chunks_completed, started_at, completed_at, error_message FROM transfers";
 
-    let mut stmt = db
-        .conn()
-        .prepare(&query)
-        .map_err(|e| format!("Query failed: {}", e))?;
-
-    let transfers = stmt
-        .query_map([], |row| {
+    let parse_transfer = |row: &rusqlite::Row<'_>| {
             Ok(Transfer {
                 transfer_id: row.get(0)?,
                 direction: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(1)?))
@@ -149,10 +157,29 @@ pub async fn get_transfers(
                 completed_at: row.get(11)?,
                 error_message: row.get(12)?,
             })
-        })
-        .map_err(|e| format!("Failed to read transfers: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
+    };
+
+    let transfers = if let Some(status) = status_filter {
+        let query = format!("{base_select} WHERE status = ?1 ORDER BY started_at DESC");
+        let mut stmt = db
+            .conn()
+            .prepare(&query)
+            .map_err(|e| format!("Query failed: {}", e))?;
+        stmt.query_map([status], parse_transfer)
+            .map_err(|e| format!("Failed to read transfers: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect()
+    } else {
+        let query = format!("{base_select} ORDER BY started_at DESC");
+        let mut stmt = db
+            .conn()
+            .prepare(&query)
+            .map_err(|e| format!("Query failed: {}", e))?;
+        stmt.query_map([], parse_transfer)
+            .map_err(|e| format!("Failed to read transfers: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
 
     Ok(transfers)
 }

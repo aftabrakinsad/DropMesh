@@ -1,6 +1,6 @@
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tauri::Emitter;
 
@@ -92,7 +92,7 @@ impl DiscoveryService {
             .map_err(|e| format!("Failed to start mDNS browse: {}", e))?;
 
         let my_device_id = device_id.to_string();
-        let trusted_ids = trusted_device_ids;
+        let trusted_ids: HashSet<String> = trusted_device_ids.into_iter().collect();
         let peers = self.peers.clone();
 
         std::thread::spawn(move || {

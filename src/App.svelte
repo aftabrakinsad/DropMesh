@@ -262,6 +262,7 @@
       const result = await invoke("pair_with_device", {
         peerHost: pairingTarget.host,
         peerPort: pairingTarget.port,
+        expectedPeerDeviceId: pairingTarget.device_id,
         pin: code,
       });
 
@@ -328,33 +329,48 @@
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
-  onMount(async () => {
-    invoke = window.__TAURI__?.core?.invoke;
-    if (!invoke) {
-      try {
-        const api = await import("@tauri-apps/api/core");
-        invoke = api.invoke;
-      } catch (e) { console.error("Tauri API unavailable:", e); }
-    }
-    await loadData();
-    setInterval(loadData, 5000);
-    if (window.__TAURI__?.event?.listen) {
-      window.__TAURI__.event.listen("on_device_discovered", e => handleDeviceDiscovered(e.payload));
-      window.__TAURI__.event.listen("on_device_lost", e => handleDeviceLost(e.payload));
-      window.__TAURI__.event.listen("queue_stats_update", e => queueStats.set(e.payload));
-      window.__TAURI__.event.listen("on_pairing_complete", e => {
-        // Device A: a peer completed the handshake with our PIN
-        verificationEmojis = e.payload.verification_emojis;
-        pairedPeerName = e.payload.peer_name;
-        pairingStep = "verify";
-        showPairing = true;
-        loadData();
-      });
-      window.__TAURI__.event.listen("on_incoming_file", e => {
-        showNotification(`Received ${e.payload.file_name}`);
-        loadData();
-      });
-    }
+  onMount(() => {
+    const unlistenPromises = [];
+    let pollTimer = null;
+
+    (async () => {
+      invoke = window.__TAURI__?.core?.invoke;
+      if (!invoke) {
+        try {
+          const api = await import("@tauri-apps/api/core");
+          invoke = api.invoke;
+        } catch (e) { console.error("Tauri API unavailable:", e); }
+      }
+      await loadData();
+      pollTimer = setInterval(loadData, 5000);
+      if (window.__TAURI__?.event?.listen) {
+        unlistenPromises.push(window.__TAURI__.event.listen("on_device_discovered", e => handleDeviceDiscovered(e.payload)));
+        unlistenPromises.push(window.__TAURI__.event.listen("on_device_lost", e => handleDeviceLost(e.payload)));
+        unlistenPromises.push(window.__TAURI__.event.listen("queue_stats_update", e => queueStats.set(e.payload)));
+        unlistenPromises.push(window.__TAURI__.event.listen("on_pairing_complete", e => {
+          // Device A: a peer completed the handshake with our PIN
+          verificationEmojis = e.payload.verification_emojis;
+          pairedPeerName = e.payload.peer_name;
+          pairingStep = "verify";
+          showPairing = true;
+          loadData();
+        }));
+        unlistenPromises.push(window.__TAURI__.event.listen("on_incoming_file", e => {
+          showNotification(`Received ${e.payload.file_name}`);
+          loadData();
+        }));
+      }
+    })();
+
+    return () => {
+      if (pollTimer) clearInterval(pollTimer);
+      if (expiryTimer) clearInterval(expiryTimer);
+      for (const promise of unlistenPromises) {
+        Promise.resolve(promise).then(unlisten => {
+          if (typeof unlisten === "function") unlisten();
+        });
+      }
+    };
   });
 
   const tabs = [
