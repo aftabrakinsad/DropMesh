@@ -16,6 +16,36 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
+    pub fn sanitize_filename(filename: &str) -> Option<String> {
+        use std::path::{Component, Path};
+
+        let path = Path::new(filename);
+        if path.is_absolute() {
+            return None;
+        }
+
+        let mut saw_normal = false;
+        for component in path.components() {
+            match component {
+                Component::Normal(_) => saw_normal = true,
+                _ => return None,
+            }
+        }
+        if !saw_normal {
+            return None;
+        }
+
+        let basename = path.file_name()?.to_string_lossy().trim().to_string();
+        if basename.is_empty() {
+            return None;
+        }
+        Some(basename)
+    }
+
+    pub fn received_root(&self) -> PathBuf {
+        self.folder_path.join("received")
+    }
+
     /// Initialize the storage manager, loading config from DB or using defaults
     pub fn new(db: &Database) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Try to load existing config
@@ -137,7 +167,10 @@ impl StorageManager {
 
     /// Get the path for a received file
     pub fn received_path(&self, filename: &str) -> PathBuf {
-        let base = self.folder_path.join("received").join(filename);
+        let safe_name = Self::sanitize_filename(filename)
+            .unwrap_or_else(|| "received_file".to_string());
+        let received_dir = self.received_root();
+        let base = received_dir.join(safe_name);
 
         // Handle filename conflicts
         if !base.exists() {
@@ -148,14 +181,14 @@ impl StorageManager {
         let ext = base.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
 
         for i in 1..1000 {
-            let candidate = self.folder_path.join("received").join(format!("{} ({}){}", stem, i, ext));
+            let candidate = received_dir.join(format!("{} ({}){}", stem, i, ext));
             if !candidate.exists() {
                 return candidate;
             }
         }
 
         // Fallback: append UUID
-        self.folder_path.join("received").join(format!(
+        received_dir.join(format!(
             "{}_{}{}",
             stem,
             uuid::Uuid::new_v4(),

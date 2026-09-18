@@ -22,10 +22,11 @@ use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Progress event pushed to the frontend during a transfer
@@ -135,7 +136,7 @@ impl TransferEngine {
         db: Arc<tokio::sync::Mutex<crate::db::Database>>,
         storage: Arc<tokio::sync::Mutex<crate::services::storage::StorageManager>>,
     ) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
-        let (cert, key) = Self::generate_self_signed_cert()?;
+        let (cert, key) = load_or_create_persistent_cert(db.clone()).await?;
         let server_config = Self::build_server_config(cert, key)?;
 
         // Bind to port 0 so the OS assigns a free port. Hard-coding a port
@@ -193,7 +194,7 @@ impl TransferEngine {
         peer_host: &str,
         peer_port: u16,
         group_key: &[u8],
-        _peer_cert: Option<CertificateDer<'static>>,
+        peer_cert_fingerprint: Option<&str>,
         sender_device_id: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let transfer_id = uuid::Uuid::new_v4().to_string();
@@ -210,7 +211,9 @@ impl TransferEngine {
         let hmac_tag = SecurityModule::compute_file_hmac(&session_key, &file_bytes);
         let chunk_count = ((file_size + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE) as u32;
 
-        let conn = open_connection(peer_host, peer_port).await?;
+        let peer_fp = peer_cert_fingerprint
+            .ok_or("Missing peer certificate fingerprint; re-pair the device")?;
+        let (conn, _) = open_connection(peer_host, peer_port, Some(peer_fp)).await?;
         let (mut send, mut recv) = conn.open_bi().await
             .map_err(|e| format!("Stream open failed: {}", e))?;
 
@@ -315,10 +318,21 @@ pub async fn handle_incoming_stream(
     let mut buf = vec![0u8; len];
     if recv.read_exact(&mut buf).await.is_err() { return; }
 
-    if let Ok(PairMessage::PairRequest { device_id, name, device_type, public_key, pin }) =
+    if let Ok(PairMessage::PairRequest { device_id, name, device_type, public_key, cert_fingerprint, pin }) =
         serde_json::from_slice::<PairMessage>(&buf)
     {
-        handle_pair_request(send, device_id, name, device_type, public_key, pin, db, app_handle).await;
+        handle_pair_request(
+            send,
+            device_id,
+            name,
+            device_type,
+            public_key,
+            cert_fingerprint,
+            pin,
+            db,
+            app_handle,
+        )
+        .await;
         return;
     }
 
@@ -342,6 +356,7 @@ async fn handle_pair_request(
     peer_name: String,
     peer_type: String,
     peer_pubkey_b64: String,
+    peer_cert_fingerprint: String,
     pin: String,
     db: Arc<tokio::sync::Mutex<crate::db::Database>>,
     app_handle: tauri::AppHandle,
@@ -417,6 +432,23 @@ async fn handle_pair_request(
         return;
     }
 
+    if !peer_cert_fingerprint.is_empty() {
+        let key = format!("peer_cert_fp:{}", peer_id);
+        let _ = db_guard.conn().execute(
+            "INSERT OR REPLACE INTO storage_config (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, peer_cert_fingerprint],
+        );
+    }
+
+    let my_cert_fp: String = db_guard
+        .conn()
+        .query_row(
+            "SELECT value FROM storage_config WHERE key = 'local_cert_fingerprint'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+
     // PIN is single-use
     let _ = db_guard.conn().execute(
         "DELETE FROM storage_config WHERE key IN
@@ -433,6 +465,7 @@ async fn handle_pair_request(
         name: my_name,
         device_type: my_type,
         public_key: STANDARD.encode(&my_pubkey),
+        cert_fingerprint: my_cert_fp,
         group_id,
         verification_emojis: emojis.clone(),
     }).await {
@@ -454,8 +487,8 @@ pub async fn send_pair_request(
     peer_host: &str,
     peer_port: u16,
     request: PairMessage,
-) -> Result<PairMessage, Box<dyn std::error::Error + Send + Sync>> {
-    let conn = open_connection(peer_host, peer_port).await?;
+) -> Result<(PairMessage, String), Box<dyn std::error::Error + Send + Sync>> {
+    let (conn, observed_fp) = open_connection(peer_host, peer_port, None).await?;
     let (mut send, mut recv) = conn.open_bi().await
         .map_err(|e| format!("Stream open failed: {}", e))?;
 
@@ -472,7 +505,7 @@ pub async fn send_pair_request(
 
     let response: PairMessage = serde_json::from_slice(&buf)?;
     let _ = send.finish();
-    Ok(response)
+    Ok((response, observed_fp))
 }
 
 // ── Receiving a file ─────────────────────────────────────────────────────────
@@ -608,7 +641,15 @@ async fn handle_incoming_transfer(
 
     let dest_path = {
         let storage = storage.lock().await;
-        storage.received_path(&file_name)
+        let safe_name = match crate::services::storage::StorageManager::sanitize_filename(&file_name) {
+            Some(name) => name,
+            None => {
+                log::error!("Rejected unsafe filename in transfer {}", transfer_id);
+                let _ = tokio::fs::remove_dir_all(&staging_path).await;
+                return;
+            }
+        };
+        storage.received_path(&safe_name)
     };
 
     if let Err(e) = tokio::fs::write(&dest_path, &full_file).await {
@@ -634,11 +675,13 @@ async fn handle_incoming_transfer(
 async fn open_connection(
     peer_host: &str,
     peer_port: u16,
-) -> Result<quinn::Connection, Box<dyn std::error::Error + Send + Sync>> {
+    expected_fingerprint: Option<&str>,
+) -> Result<(quinn::Connection, String), Box<dyn std::error::Error + Send + Sync>> {
+    let observed_fingerprint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
     let mut endpoint = Endpoint::client(bind_addr)
         .map_err(|e| format!("QUIC client bind failed: {}", e))?;
-    endpoint.set_default_client_config(build_client_config()?);
+    endpoint.set_default_client_config(build_client_config(expected_fingerprint, observed_fingerprint.clone())?);
 
     let peer_addr: SocketAddr = format!("{}:{}", peer_host, peer_port).parse()
         .map_err(|e| format!("Invalid address {}:{} — {}", peer_host, peer_port, e))?;
@@ -649,7 +692,13 @@ async fn open_connection(
         .await
         .map_err(|e| format!("Could not reach {}: {}", peer_addr, e))?;
 
-    Ok(conn)
+    let observed = observed_fingerprint
+        .lock()
+        .map_err(|_| "Failed to read observed certificate fingerprint")?
+        .clone()
+        .ok_or("Missing observed certificate fingerprint")?;
+
+    Ok((conn, observed))
 }
 
 async fn write_message(
@@ -696,20 +745,100 @@ fn get_group_key_for_device(db: &crate::db::Database, device_id: &str) -> Option
     ).ok()
 }
 
-/// Peer certificates are self-signed and regenerated each launch, so TLS
-/// chain validation is skipped. Authenticity comes from the pairing PIN and
-/// the per-file HMAC instead. Pinning peer certs at pairing time would be a
-/// worthwhile hardening step later.
-fn build_client_config() -> Result<ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    #[derive(Debug)]
-    struct AcceptAnyCert;
+fn cert_fingerprint(cert_der: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cert_der);
+    hex::encode(hasher.finalize())
+}
 
-    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+async fn load_or_create_persistent_cert(
+    db: Arc<tokio::sync::Mutex<crate::db::Database>>,
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), Box<dyn std::error::Error + Send + Sync>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    {
+        let db_guard = db.lock().await;
+        let cert_b64: Result<String, _> = db_guard.conn().query_row(
+            "SELECT value FROM storage_config WHERE key = 'local_cert_der_b64'",
+            [],
+            |row| row.get(0),
+        );
+        let key_b64: Result<String, _> = db_guard.conn().query_row(
+            "SELECT value FROM storage_config WHERE key = 'local_key_der_b64'",
+            [],
+            |row| row.get(0),
+        );
+
+        if let (Ok(cert_b64), Ok(key_b64)) = (cert_b64, key_b64) {
+            let cert_bytes = STANDARD.decode(cert_b64)?;
+            let key_bytes = STANDARD.decode(key_b64)?;
+            let cert = CertificateDer::from(cert_bytes.clone());
+            let key = PrivateKeyDer::try_from(key_bytes)?;
+            let fp = cert_fingerprint(&cert_bytes);
+            let _ = db_guard.conn().execute(
+                "INSERT OR REPLACE INTO storage_config (key, value) VALUES (?1, ?2)",
+                rusqlite::params!["local_cert_fingerprint", fp],
+            );
+            return Ok((cert, key));
+        }
+    }
+
+    let (cert, key) = TransferEngine::generate_self_signed_cert()?;
+    let cert_bytes = cert.as_ref().to_vec();
+    let key_bytes = key.secret_der().to_vec();
+    let fp = cert_fingerprint(&cert_bytes);
+
+    let db_guard = db.lock().await;
+    let _ = db_guard.conn().execute(
+        "INSERT OR REPLACE INTO storage_config (key, value) VALUES (?1, ?2)",
+        rusqlite::params![
+            "local_cert_der_b64",
+            STANDARD.encode(&cert_bytes),
+        ],
+    );
+    let _ = db_guard.conn().execute(
+        "INSERT OR REPLACE INTO storage_config (key, value) VALUES (?1, ?2)",
+        rusqlite::params![
+            "local_key_der_b64",
+            STANDARD.encode(&key_bytes),
+        ],
+    );
+    let _ = db_guard.conn().execute(
+        "INSERT OR REPLACE INTO storage_config (key, value) VALUES (?1, ?2)",
+        rusqlite::params!["local_cert_fingerprint", fp],
+    );
+
+    Ok((cert, key))
+}
+
+fn build_client_config(
+    expected_fingerprint: Option<&str>,
+    observed_fingerprint: Arc<Mutex<Option<String>>>,
+) -> Result<ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    #[derive(Debug)]
+    struct PinnedCertVerifier {
+        expected_fingerprint: Option<String>,
+        observed_fingerprint: Arc<Mutex<Option<String>>>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         fn verify_server_cert(
-            &self, _: &CertificateDer, _: &[CertificateDer],
+            &self,
+            end_entity: &CertificateDer,
+            _: &[CertificateDer],
             _: &rustls::pki_types::ServerName, _: &[u8],
             _: rustls::pki_types::UnixTime,
         ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            let fingerprint = cert_fingerprint(end_entity.as_ref());
+            if let Ok(mut lock) = self.observed_fingerprint.lock() {
+                *lock = Some(fingerprint.clone());
+            }
+
+            if let Some(expected) = &self.expected_fingerprint {
+                if &fingerprint != expected {
+                    return Err(rustls::Error::General("Peer certificate fingerprint mismatch".to_string()));
+                }
+            }
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         }
         fn verify_tls12_signature(
@@ -728,9 +857,14 @@ fn build_client_config() -> Result<ClientConfig, Box<dyn std::error::Error + Sen
         }
     }
 
+    let verifier = PinnedCertVerifier {
+        expected_fingerprint: expected_fingerprint.map(|s| s.to_string()),
+        observed_fingerprint,
+    };
+
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"dropmesh/1".to_vec()];
 

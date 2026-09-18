@@ -28,6 +28,7 @@ pub enum PairMessage {
         name: String,
         device_type: String,
         public_key: String,   // base64
+        cert_fingerprint: String,
         pin: String,          // the 6-digit code shown on Device A
     },
     /// Device A → Device B: "PIN accepted, here's my identity"
@@ -36,6 +37,7 @@ pub enum PairMessage {
         name: String,
         device_type: String,
         public_key: String,   // base64
+        cert_fingerprint: String,
         group_id: String,
         verification_emojis: String,
     },

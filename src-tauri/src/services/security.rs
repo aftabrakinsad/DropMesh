@@ -15,6 +15,8 @@ use ring::hkdf;
 use ring::rand::SystemRandom;
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
+use std::io::Read;
+use std::path::Path;
 
 use crate::db::Database;
 
@@ -343,6 +345,22 @@ impl SecurityModule {
         let mut hasher = Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())
+    }
+
+    pub fn hash_file_path(path: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+
+        Ok(hex::encode(hasher.finalize()))
     }
 }
 
